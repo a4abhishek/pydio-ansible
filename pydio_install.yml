@@ -1,0 +1,161 @@
+---
+- name: Install Pydio Cells on Raspberry Pi
+  hosts: raspberry_pi
+  become: yes
+  vars_files:
+    - secret.yml
+  tasks:
+    - name: Ensure Python3 is installed
+      apt:
+        name: python3
+        state: present
+
+    - name: Install PyMySQL for Python3
+      apt:
+        name: python3-pymysql
+        state: present
+
+    - name: Create pydio user
+      user:
+        name: pydio
+        shell: /bin/bash
+        create_home: yes
+
+    - name: Create necessary directories
+      file:
+        path: "{{ item }}"
+        state: directory
+        owner: pydio
+        group: pydio
+      loop:
+        - /opt/pydio/bin
+        - /var/cells/certs
+
+    - name: Set environment variable
+      blockinfile:
+        path: /etc/profile.d/cells-env.sh
+        block: |
+          export CELLS_WORKING_DIR=/var/cells
+        create: yes
+        mode: '0755'
+
+    - name: Install MariaDB server
+      apt:
+        name: mariadb-server
+        state: present
+
+    - name: Set the MariaDB root password
+      mysql_user:
+        login_user: root
+        login_password: "{{ mariadb_root_password }}"
+        login_unix_socket: /var/run/mysqld/mysqld.sock
+        name: root
+        password: "{{ mariadb_root_password }}"
+        host: localhost
+
+    - name: Remove anonymous MariaDB user accounts
+      mysql_user:
+        login_user: root
+        login_password: "{{ mariadb_root_password }}"
+        login_unix_socket: /var/run/mysqld/mysqld.sock
+        name: ''
+        host_all: yes
+        state: absent
+
+    - name: Disallow root login remotely
+      mysql_user:
+        login_user: root
+        login_password: "{{ mariadb_root_password }}"
+        login_unix_socket: /var/run/mysqld/mysqld.sock
+        name: root
+        host: '%'
+        state: absent
+
+    - name: Remove the test database
+      mysql_db:
+        login_user: root
+        login_password: "{{ mariadb_root_password }}"
+        login_unix_socket: /var/run/mysqld/mysqld.sock
+        name: test
+        state: absent
+
+    - name: Flush privileges
+      command: mysql -u root -p"{{ mariadb_root_password }}" -e "FLUSH PRIVILEGES;"
+
+    - name: Create database for Pydio
+      mysql_db:
+        login_user: root
+        login_password: "{{ mariadb_root_password }}"
+        login_unix_socket: /var/run/mysqld/mysqld.sock
+        name: cells
+        state: present
+
+    - name: Create user for Pydio
+      mysql_user:
+        login_user: root
+        login_password: "{{ mariadb_root_password }}"
+        login_unix_socket: /var/run/mysqld/mysqld.sock
+        name: pydio
+        password: "{{ pydio_db_password }}"
+        priv: 'cells.*:ALL'
+        state: present
+
+    - name: Download Pydio Cells zip file
+      get_url:
+        url: "https://download.pydio.com/latest/cells/release/%7Blatest%7D/linux-arm/pydio-cells-%7Blatest%7D-linux-arm.zip"
+        dest: "/tmp/pydio-cells-latest-linux-arm.zip"
+        mode: '0644'
+
+    - name: Extract Pydio Cells binary from zip file
+      command:
+        cmd: unzip -o /tmp/pydio-cells-latest-linux-arm.zip -d /opt/pydio/bin/
+      args:
+        creates: /opt/pydio/bin/cells
+
+    - name: Set capabilities on binary
+      command: setcap 'cap_net_bind_service=+ep' /opt/pydio/bin/cells
+
+    - name: Link cells command
+      file:
+        src: /opt/pydio/bin/cells
+        dest: /usr/local/bin/cells
+        state: link
+
+    - name: Create systemd service file for Pydio Cells
+      copy:
+        dest: /etc/systemd/system/cells.service
+        content: |
+          [Unit]
+          Description=Pydio Cells
+          Documentation=https://pydio.com
+          Wants=network-online.target
+          After=network-online.target
+          AssertFileIsExecutable=/opt/pydio/bin/cells
+
+          [Service]
+          User=pydio
+          Group=pydio
+          PermissionsStartOnly=true
+          AmbientCapabilities=CAP_NET_BIND_SERVICE
+          ExecStart=/opt/pydio/bin/cells start
+          Restart=on-failure
+          StandardOutput=journal
+          StandardError=inherit
+          LimitNOFILE=65536
+          TimeoutStopSec=5
+          KillSignal=INT
+          SendSIGKILL=yes
+          SuccessExitStatus=0
+          WorkingDirectory=/home/pydio
+          Environment=CELLS_WORKING_DIR=/var/cells
+
+          [Install]
+          WantedBy=multi-user.target
+
+    - name: Enable and start Pydio Cells service
+      systemd:
+        name: cells
+        enabled: yes
+        state: started
+        daemon_reload: yes
+
